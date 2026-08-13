@@ -350,3 +350,14 @@ fn load_quirks() -> HashMap<String, Quirk> {
 pub fn resolve_quirk(sku: &str) -> Option<&'static Quirk> {
     QUIRKS.get(sku)
 }
+
+/// SKU-specific work-mode number that means "music mode is active" in the
+/// `state.mode` integer from AWS IoT status messages (`DeviceStatus::mode`).
+/// The numbering is not shared across families — H6009 bulbs report 13 while
+/// animating — so only SKUs verified live belong here.
+pub fn music_mode_value(sku: &str) -> Option<i64> {
+    match sku {
+        "H607C" | "H60B2" | "H6020" => Some(4),
+        _ => None,
+    }
+}

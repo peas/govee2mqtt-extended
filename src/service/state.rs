@@ -563,6 +563,34 @@ impl State {
             return Ok(());
         }
 
+        // A colour sent over LAN (or IoT `colorwc`) to a device that is
+        // actively animating in music mode is consumed as a parameter of the
+        // running animation on several SKUs: the device ACKs, its status
+        // reports the new colour, and it keeps dancing — so the LAN
+        // poll-for-colour below "succeeds" without the light ever changing.
+        // Only a Platform API colour command returns it to manual colour.
+        // The freshness bound matters: LAN/HTTP states carry the last IoT
+        // mode forward indefinitely, so a stale value must fall through to
+        // the normal chain instead of re-routing colours hours after the
+        // music stopped.
+        if device.music_mode_active() == Some(true) {
+            if let Some(client) = self.get_platform_client().await {
+                if let Some(info) = &device.http_device_info {
+                    log::info!(
+                        "{device} is in music mode; using Platform API to set color \
+                         so that it actually leaves the mode"
+                    );
+                    client.set_color_rgb(info, r, g, b).await?;
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene(None);
+                    return Ok(());
+                }
+            }
+            // No platform client/device info: fall through to the usual
+            // chain rather than failing a command we would otherwise try.
+        }
+
         if let Some(lan_dev) = &device.lan_device {
             let color = crate::lan_api::DeviceColor { r, g, b };
             log::info!("Using LAN API to set {device} color");

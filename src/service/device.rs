@@ -376,6 +376,31 @@ impl Device {
         candidates.pop()
     }
 
+    /// The work mode last learned via AWS IoT, but only if the report is
+    /// fresh enough to base a control decision on. Freshness is judged
+    /// against `last_iot_device_status_update` rather than
+    /// `DeviceState::updated`: the LAN/HTTP carry-over re-stamps the same
+    /// mode with a newer timestamp, and IoT status pushes only arrive after
+    /// a cloud command or poll, so the projected value can be hours old
+    /// while looking current.
+    pub fn fresh_iot_mode(&self) -> Option<i64> {
+        let updated = self.last_iot_device_status_update?;
+        let age = Utc::now().signed_duration_since(updated);
+        if age > *POLL_INTERVAL + chrono::Duration::seconds(30) {
+            return None;
+        }
+        self.iot_device_status.as_ref()?.mode
+    }
+
+    /// Whether the device is known to be in music mode right now.
+    /// `Some(true)` requires a quirk entry for the SKU's music-mode number
+    /// AND a fresh IoT-reported mode; anything less is `None`, and callers
+    /// should keep their default behaviour.
+    pub fn music_mode_active(&self) -> Option<bool> {
+        let music = crate::service::quirks::music_mode_value(&self.sku)?;
+        Some(self.fresh_iot_mode()? == music)
+    }
+
     /// Returns the active scene name, if any
     pub fn active_scene_name(&self) -> Option<&str> {
         self.active_scene.as_deref()
@@ -716,5 +741,71 @@ mod test {
         device.set_iot_device_status(off_frame);
 
         assert_eq!(device.active_scene_name(), None);
+    }
+
+    fn status_with_mode(mode: Option<i64>) -> LanDeviceStatus {
+        LanDeviceStatus {
+            on: true,
+            brightness: 100,
+            color: DeviceColor { r: 255, g: 0, b: 0 },
+            color_temperature_kelvin: 0,
+            mode,
+        }
+    }
+
+    /// Regression guard for the field itself: a `mode` learned from an AWS IoT
+    /// status must survive into the synthesized `DeviceState`, whichever
+    /// source projection wins.
+    #[test]
+    fn iot_status_mode_reaches_device_state() {
+        let mut device = Device::new("H607C", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_iot_device_status(status_with_mode(Some(5)));
+        assert_eq!(device.device_state().expect("iot state").mode, Some(5));
+    }
+
+    /// The LAN `devStatus` response has no mode field; the projection carries
+    /// the last IoT-learned mode forward even when the LAN state is newer and
+    /// wins the source race.
+    #[test]
+    fn iot_mode_carries_over_into_newer_lan_projection() {
+        let mut device = Device::new("H607C", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_iot_device_status(status_with_mode(Some(4)));
+        device.set_lan_device_status(status_with_mode(None));
+        device.last_lan_device_status_update = Some(Utc::now() + chrono::Duration::seconds(5));
+
+        let state = device.device_state().expect("lan state");
+        assert_eq!(state.source, "LAN API");
+        assert_eq!(state.mode, Some(4));
+    }
+
+    /// The carry-over above re-stamps a possibly ancient mode with a fresh
+    /// `updated`, so control decisions must judge freshness against the IoT
+    /// timestamp itself: an aged report stops counting as "in music mode".
+    #[test]
+    fn music_mode_active_requires_fresh_iot_report() {
+        let mut device = Device::new("H607C", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_iot_device_status(status_with_mode(Some(4)));
+        assert_eq!(device.music_mode_active(), Some(true));
+
+        device.last_iot_device_status_update =
+            Some(Utc::now() - (*POLL_INTERVAL + chrono::Duration::seconds(31)));
+        assert_eq!(device.fresh_iot_mode(), None);
+        assert_eq!(device.music_mode_active(), None);
+    }
+
+    /// The mode numbering is SKU-specific, so SKUs without a verified quirk
+    /// entry must never claim music mode — callers keep default routing.
+    #[test]
+    fn music_mode_active_is_none_for_unverified_sku() {
+        let mut device = Device::new("H6000", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_iot_device_status(status_with_mode(Some(4)));
+        assert_eq!(device.music_mode_active(), None);
+    }
+
+    #[test]
+    fn music_mode_active_is_false_in_manual_colour() {
+        let mut device = Device::new("H607C", "AA:BB:CC:DD:EE:FF:42:2A");
+        device.set_iot_device_status(status_with_mode(Some(5)));
+        assert_eq!(device.music_mode_active(), Some(false));
     }
 }
